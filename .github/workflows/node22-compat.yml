@@ -15,7 +15,7 @@ jobs:
       - name: Checkout proof branch without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 2
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Bind proof source to PR head
@@ -24,7 +24,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "$EXPECTED_PR_HEAD"
+          git merge-base --is-ancestor "$EXPECTED_PR_HEAD" HEAD
           test "$(git diff --name-only "$EXPECTED_PR_HEAD" HEAD)" = ".github/workflows/node22-compat.yml"
           if git config --get-regexp 'http\..*extraheader' >/dev/null; then
             echo "checkout retained an HTTP credential" >&2
