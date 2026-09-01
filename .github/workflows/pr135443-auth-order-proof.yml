@@ -107,13 +107,51 @@ jobs:
           done
           grep -q '^LOCK_READY$' "$lock_log"
 
+          login_driver="$RUNNER_TEMP/auth-login-proof.mts"
+          cat >"$login_driver" <<'TS'
+          import path from "node:path";
+          import { pathToFileURL } from "node:url";
+
+          const root = process.env.GITHUB_WORKSPACE;
+          if (!root) {
+            throw new Error("GITHUB_WORKSPACE is missing");
+          }
+          const authModule = await import(
+            pathToFileURL(path.join(root, "src/commands/models/auth.ts")).href
+          );
+          const runtimeModule = await import(pathToFileURL(path.join(root, "src/runtime.ts")).href);
+          const prompter = {
+            intro: async () => {},
+            outro: async () => {},
+            note: async () => {},
+            plain: async () => {},
+            select: async (params) => params.initialValue ?? params.options[0]?.value,
+            multiselect: async (params) => params.initialValues ?? [],
+            text: async () => process.env.SYNTHETIC_API_KEY ?? "",
+            confirm: async (params) => params.initialValue ?? true,
+            progress: () => ({ update: () => {}, stop: () => {} }),
+          };
+
+          try {
+            await authModule.runModelsAuthLoginFlowCore({
+              provider: "synthetic",
+              method: "api-key",
+              profileId: "synthetic:new",
+              runtime: runtimeModule.defaultRuntime,
+              prompter,
+              env: process.env,
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(`LOGIN_FLOW_ERROR: ${message}`);
+            process.exitCode = 42;
+          }
+          TS
+
           set +e
-          while :; do printf '\r'; sleep 0.2; done |
-            timeout --kill-after=5s 60s script -qefc \
-              'pnpm openclaw models auth login --provider synthetic --method api-key --profile-id synthetic:new' \
-              "$RUNNER_TEMP/login-contended.raw" \
-              >"$RUNNER_TEMP/login-contended.console.raw" 2>&1
-          contended_status=${PIPESTATUS[1]}
+          timeout --kill-after=5s 60s pnpm exec tsx "$login_driver" \
+            >"$RUNNER_TEMP/login-contended.raw" 2>&1
+          contended_status=$?
           set -e
 
           cleanup_lock
@@ -131,7 +169,7 @@ jobs:
           writeFileSync(process.env.RUNNER_TEMP + "/pr135443-proof/contended-login.txt", cleaned);
           NODE
 
-          test "$contended_status" -ne 0
+          test "$contended_status" -eq 42
           rg -F \
             'The auth profile was saved, but its order could not be updated because the auth store is busy. Wait a moment, then retry the login.' \
             "$proof_dir/contended-login.txt"
@@ -160,12 +198,9 @@ jobs:
           NODE
 
           set +e
-          while :; do printf '\r'; sleep 0.2; done |
-            timeout --kill-after=5s 60s script -qefc \
-              'pnpm openclaw models auth login --provider synthetic --method api-key --profile-id synthetic:new' \
-              "$RUNNER_TEMP/login-retry.raw" \
-              >"$RUNNER_TEMP/login-retry.console.raw" 2>&1
-          retry_status=${PIPESTATUS[1]}
+          timeout --kill-after=5s 60s pnpm exec tsx "$login_driver" \
+            >"$RUNNER_TEMP/login-retry.raw" 2>&1
+          retry_status=$?
           set -e
           test "$retry_status" -eq 0
           node --input-type=module - <<'NODE'
