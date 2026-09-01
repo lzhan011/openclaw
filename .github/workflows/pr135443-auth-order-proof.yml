@@ -108,8 +108,8 @@ jobs:
           grep -q '^LOCK_READY$' "$lock_log"
 
           set +e
-          yes '' |
-            timeout --signal=TERM 90s script -qefc \
+          while :; do printf '\r'; sleep 0.2; done |
+            timeout --kill-after=5s 60s script -qefc \
               'pnpm openclaw models auth login --provider synthetic --method api-key --profile-id synthetic:new' \
               "$RUNNER_TEMP/login-contended.raw" \
               >"$RUNNER_TEMP/login-contended.console.raw" 2>&1
@@ -160,8 +160,8 @@ jobs:
           NODE
 
           set +e
-          yes '' |
-            timeout --signal=TERM 90s script -qefc \
+          while :; do printf '\r'; sleep 0.2; done |
+            timeout --kill-after=5s 60s script -qefc \
               'pnpm openclaw models auth login --provider synthetic --method api-key --profile-id synthetic:new' \
               "$RUNNER_TEMP/login-retry.raw" \
               >"$RUNNER_TEMP/login-retry.console.raw" 2>&1
