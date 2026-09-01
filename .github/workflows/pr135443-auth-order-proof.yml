@@ -108,8 +108,8 @@ jobs:
           grep -q '^LOCK_READY$' "$lock_log"
 
           set +e
-          printf '\n\n' |
-            script -qefc \
+          yes '' |
+            timeout --signal=TERM 90s script -qefc \
               'pnpm openclaw models auth login --provider synthetic --method api-key --profile-id synthetic:new' \
               "$RUNNER_TEMP/login-contended.raw" \
               >"$RUNNER_TEMP/login-contended.console.raw" 2>&1
@@ -159,11 +159,15 @@ jobs:
           }
           NODE
 
-          printf '\n\n' |
-            script -qefc \
+          set +e
+          yes '' |
+            timeout --signal=TERM 90s script -qefc \
               'pnpm openclaw models auth login --provider synthetic --method api-key --profile-id synthetic:new' \
               "$RUNNER_TEMP/login-retry.raw" \
               >"$RUNNER_TEMP/login-retry.console.raw" 2>&1
+          retry_status=${PIPESTATUS[1]}
+          set -e
+          test "$retry_status" -eq 0
           node --input-type=module - <<'NODE'
           import { readFileSync, writeFileSync } from "node:fs";
 
