@@ -4,6 +4,24 @@ on:
   schedule:
     - cron: "23 5 * * 1"
   workflow_dispatch:
+    inputs:
+      proof_mode:
+        description: Optional narrowly scoped proof lane
+        required: false
+        default: compat
+        type: choice
+        options: [compat, auth-order]
+      target_ref:
+        description: Exact 40-character commit SHA for the proof lane
+        required: false
+        default: ""
+        type: string
+      expected_outcome:
+        description: Expected focused-test outcome for the proof lane
+        required: false
+        default: success
+        type: choice
+        options: [success, failure]
 
 permissions:
   actions: read
@@ -17,6 +35,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'auth-order' && inputs.target_ref || github.ref }}
+          persist-credentials: false
 
       - name: Setup Node environment
         uses: ./.github/actions/setup-node-env
@@ -26,6 +47,7 @@ jobs:
           install-bun: "false"
 
       - name: Resolve trusted declaration cache artifact
+        if: inputs.proof_mode != 'auth-order'
         id: declaration_cache
         env:
           ARTIFACT_NAME: build-all-cache-v1-Linux-X64-node-22.23.2
@@ -100,6 +122,7 @@ jobs:
         run: echo "OPENCLAW_VITEST_MAX_WORKERS=2" >> "$GITHUB_ENV"
 
       - name: Run Node 22 compatibility
+        if: inputs.proof_mode != 'auth-order'
         env:
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
@@ -109,8 +132,61 @@ jobs:
           node openclaw.mjs status --json --timeout 1
           pnpm test:build:singleton
 
+      - name: Run auth order proof
+        if: inputs.proof_mode == 'auth-order'
+        env:
+          EXPECTED_OUTCOME: ${{ inputs.expected_outcome }}
+          TARGET_REF: ${{ inputs.target_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$TARGET_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "target_ref must be a full commit SHA" >&2
+            exit 1
+          fi
+          checked_out_sha="$(git rev-parse HEAD)"
+          if [[ "$checked_out_sha" != "$TARGET_REF" ]]; then
+            echo "checked out $checked_out_sha instead of $TARGET_REF" >&2
+            exit 1
+          fi
+
+          mkdir -p .artifacts/auth-order-proof
+          set +e
+          node scripts/run-vitest.mjs src/commands/models/auth.test.ts --reporter=verbose \
+            2>&1 | tee .artifacts/auth-order-proof/test.log
+          test_status="${PIPESTATUS[0]}"
+          set -e
+          printf 'target_ref=%s\nexpected_outcome=%s\ntest_status=%s\n' \
+            "$TARGET_REF" "$EXPECTED_OUTCOME" "$test_status" \
+            > .artifacts/auth-order-proof/result.txt
+
+          if [[ "$EXPECTED_OUTCOME" == "failure" ]]; then
+            if [[ "$test_status" -eq 0 ]]; then
+              echo "focused test unexpectedly passed" >&2
+              exit 1
+            fi
+            grep -F "fails visibly when login cannot update the auth profile order" \
+              .artifacts/auth-order-proof/test.log
+            grep -F "promise resolved" .artifacts/auth-order-proof/test.log
+            exit "$test_status"
+          fi
+          if [[ "$EXPECTED_OUTCOME" != "success" ]]; then
+            echo "expected_outcome must be success or failure" >&2
+            exit 1
+          fi
+          exit "$test_status"
+
+      - name: Publish auth order proof
+        if: always() && inputs.proof_mode == 'auth-order'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0 # v7
+        with:
+          if-no-files-found: error
+          name: auth-order-proof-${{ inputs.target_ref }}-${{ inputs.expected_outcome }}
+          path: .artifacts/auth-order-proof
+          retention-days: 14
+
       - name: Publish trusted declaration cache artifact
-        if: success() && github.repository == 'openclaw/openclaw' && github.ref == 'refs/heads/main'
+        if: success() && inputs.proof_mode != 'auth-order' && github.repository == 'openclaw/openclaw' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           compression-level: 1
