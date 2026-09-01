@@ -1,122 +1,192 @@
-name: Node 22 Compat
+name: PR 134740 Real Gateway Proof
 
 on:
-  schedule:
-    - cron: "23 5 * * 1"
   workflow_dispatch:
 
 permissions:
-  actions: read
   contents: read
 
 jobs:
-  compat:
-    if: github.repository == 'openclaw/openclaw' || github.event_name == 'workflow_dispatch'
+  prove:
+    name: Real Gateway RPC presence bound
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
-      - name: Checkout repository
+      - name: Checkout proof branch without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
         with:
-          cache-mode: restore
-          node-version: "22.23.2"
-          install-bun: "false"
+          fetch-depth: 2
+          persist-credentials: false
 
-      - name: Resolve trusted declaration cache artifact
-        id: declaration_cache
+      - name: Bind proof source to PR head
         env:
-          ARTIFACT_NAME: build-all-cache-v1-Linux-X64-node-22.23.2
-          GH_TOKEN: ${{ github.token }}
+          EXPECTED_PR_HEAD: 5d0a8224ddb94cc21f64201bda12cc705bc624bd
         shell: bash
         run: |
           set -euo pipefail
-          if ! runs_json="$(
-            gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/workflows/node22-compat.yml/runs?branch=main&status=success&per_page=5" \
-              2>/dev/null
-          )"; then
-            echo "::warning::Unable to list trusted Node 22 runs; continuing cold."
-            exit 0
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PR_HEAD"
+          test "$(git diff --name-only "$EXPECTED_PR_HEAD" HEAD)" = ".github/workflows/node22-compat.yml"
+          if git config --get-regexp 'http\..*extraheader' >/dev/null; then
+            echo "checkout retained an HTTP credential" >&2
+            exit 1
           fi
+          printf 'proofSourceHead=%s\n' "$EXPECTED_PR_HEAD"
+          printf 'proofHarnessCommit=%s\n' "$(git rev-parse HEAD)"
+          printf 'sourceDelta=workflow-only\n'
 
-          while IFS=$'\t' read -r run_id source_sha; do
-            [[ "$run_id" =~ ^[1-9][0-9]*$ && "$source_sha" =~ ^[0-9a-f]{40}$ ]] || continue
-            if ! artifacts_json="$(
-              gh api \
-                "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=10" \
-                2>/dev/null
-            )"; then
-              continue
-            fi
-            artifact_id="$(
-              jq -r \
-                --arg name "$ARTIFACT_NAME" \
-                --arg run_id "$run_id" \
-                'first(.artifacts[] | select(
-                  .expired == false and
-                  .name == $name and
-                  (.workflow_run.id | tostring) == $run_id
-                ) | .id) // empty' \
-                <<<"$artifacts_json"
-            )"
-            if [[ ! "$artifact_id" =~ ^[1-9][0-9]*$ ]]; then
-              continue
-            fi
-            echo "artifact_id=$artifact_id" >> "$GITHUB_OUTPUT"
-            echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-            echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
-            exit 0
-          done < <(
-            jq -r '
-              .workflow_runs[] |
-              select(
-                .status == "completed" and
-                .conclusion == "success" and
-                .head_branch == "main" and
-                (.path | split("@")[0]) == ".github/workflows/node22-compat.yml" and
-                (.event == "schedule" or .event == "workflow_dispatch")
-              ) |
-              [.id, .head_sha] |
-              @tsv
-            ' <<<"$runs_json"
-          )
-
-      - name: Restore trusted declaration cache artifact
-        if: steps.declaration_cache.outputs.artifact_id != ''
-        continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - name: Setup public toolchain
+        uses: ./.github/actions/setup-node-env
         with:
-          artifact-ids: ${{ steps.declaration_cache.outputs.artifact_id }}
-          github-token: ${{ github.token }}
-          merge-multiple: true
-          path: .artifacts/build-all-cache
-          repository: ${{ github.repository }}
-          run-id: ${{ steps.declaration_cache.outputs.run_id }}
+          cache-mode: off
+          install-bun: "false"
+          install-trufflehog: "false"
 
-      - name: Configure Node test resources
-        run: echo "OPENCLAW_VITEST_MAX_WORKERS=2" >> "$GITHUB_ENV"
-
-      - name: Run Node 22 compatibility
+      - name: Run real Gateway and WebSocket RPC proof
         env:
-          NODE_OPTIONS: --max-old-space-size=8192
+          EXPECTED_PR_HEAD: 5d0a8224ddb94cc21f64201bda12cc705bc624bd
+        shell: bash
         run: |
-          pnpm build
-          pnpm ui:build
-          node openclaw.mjs --help
-          node openclaw.mjs status --json --timeout 1
-          pnpm test:build:singleton
+          set -Eeuo pipefail
 
-      - name: Publish trusted declaration cache artifact
-        if: success() && github.repository == 'openclaw/openclaw' && github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+          proof_tmp="$(mktemp -d)"
+          gateway_pid=""
+          cleanup() {
+            rc=$?
+            trap - EXIT
+            if [[ -n "$gateway_pid" ]]; then
+              kill "$gateway_pid" >/dev/null 2>&1 || true
+              wait "$gateway_pid" >/dev/null 2>&1 || true
+            fi
+            rm -rf -- "$proof_tmp"
+            exit "$rc"
+          }
+          trap cleanup EXIT
+
+          export HOME="$proof_tmp/home"
+          export OPENCLAW_STATE_DIR="$proof_tmp/state"
+          export OPENCLAW_CONFIG_PATH="$proof_tmp/state/openclaw.json"
+          export OPENCLAW_GATEWAY_TOKEN
+          OPENCLAW_GATEWAY_TOKEN="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))')"
+          export OPENCLAW_SKIP_CHANNELS=1
+          export OPENCLAW_SKIP_PROVIDERS=1
+          export OPENCLAW_SKIP_CRON=1
+          export OPENCLAW_SKIP_GMAIL_WATCHER=1
+          export OPENCLAW_SKIP_CANVAS_HOST=1
+          export OPENCLAW_SKIP_BROWSER_CONTROL_SERVER=1
+          export OPENCLAW_DISABLE_BUNDLED_PLUGINS=1
+          mkdir -p "$HOME" "$OPENCLAW_STATE_DIR" "$GITHUB_WORKSPACE/proof-output"
+
+          pnpm build
+
+          gateway_url="ws://127.0.0.1:28789"
+          node openclaw.mjs gateway run \
+            --dev --reset --allow-unconfigured \
+            --bind loopback --port 28789 \
+            --auth token --ws-log compact \
+            >"$proof_tmp/gateway.log" 2>&1 &
+          gateway_pid=$!
+
+          ready=0
+          for _ in $(seq 1 120); do
+            if node openclaw.mjs gateway call health --url "$gateway_url" --json \
+              >"$proof_tmp/health.json" 2>"$proof_tmp/health.err"; then
+              ready=1
+              break
+            fi
+            sleep 0.5
+          done
+          test "$ready" = "1"
+
+          gateway_call() {
+            method=$1
+            output=$2
+            params=${3-}
+            if [[ -n "$params" ]]; then
+              node openclaw.mjs gateway call "$method" --url "$gateway_url" \
+                --params "$params" --json >"$output"
+            else
+              node openclaw.mjs gateway call "$method" --url "$gateway_url" --json >"$output"
+            fi
+          }
+
+          gateway_call system-presence "$proof_tmp/before.json"
+          jq -e 'type == "array"' "$proof_tmp/before.json" >/dev/null
+          self_selector='map(select(.reason == "self" and .mode == "gateway" and .deviceId == null))'
+          self_count="$(jq "$self_selector | length" "$proof_tmp/before.json")"
+          test "$self_count" = "1"
+          self_host="$(jq -er "$self_selector | .[0].host" "$proof_tmp/before.json")"
+          self_instance="$(jq -er "$self_selector | .[0].instanceId" "$proof_tmp/before.json")"
+          self_text="$(jq -er "$self_selector | .[0].text" "$proof_tmp/before.json")"
+          self_fingerprint="$(printf '%s' "$self_instance" | sha256sum | cut -d' ' -f1)"
+          before_rows="$(jq 'length' "$proof_tmp/before.json")"
+
+          collision_params="$(jq -nc \
+            --arg host "$self_host" --arg instance "$self_instance" \
+            '{text:("Node: "+$host+" (127.0.0.254) · app 0.0.0 · last input 0s ago · mode forged · reason self"),deviceId:$host,instanceId:$instance,host:$host,ip:"127.0.0.254",mode:"forged",reason:"self",version:"0.0.0"}')"
+          gateway_call system-event "$proof_tmp/collision-ack.json" "$collision_params"
+          jq -e '.ok == true' "$proof_tmp/collision-ack.json" >/dev/null
+          gateway_call system-presence "$proof_tmp/after-collision.json"
+
+          collision_genuine="$(jq --arg instance "$self_instance" --arg text "$self_text" \
+            '[.[]|select(.instanceId==$instance and .text==$text and .mode=="gateway" and .reason=="self" and .deviceId==null)]|length' \
+            "$proof_tmp/after-collision.json")"
+          collision_forged="$(jq --arg host "$self_host" --arg instance "$self_instance" \
+            '[.[]|select(.deviceId==$host and .instanceId==$instance and .mode=="forged" and .reason=="self")]|length' \
+            "$proof_tmp/after-collision.json")"
+          test "$collision_genuine" = "1"
+          test "$collision_forged" = "1"
+
+          acknowledged=0
+          for index in $(seq 0 204); do
+            peer_id="$(printf 'pr134740-peer-%03d' "$index")"
+            peer_instance="$(printf 'pr134740-instance-%03d' "$index")"
+            peer_params="$(jq -nc --arg peer "$peer_id" --arg instance "$peer_instance" \
+              '{text:("Node: "+$peer+" (127.0.0.2) · app 1.0.0 · last input 0s ago · mode qa · reason connect"),deviceId:$peer,instanceId:$instance,host:$peer,ip:"127.0.0.2",mode:"qa",reason:"connect",version:"1.0.0"}')"
+            gateway_call system-event "$proof_tmp/peer-ack.json" "$peer_params"
+            jq -e '.ok == true' "$proof_tmp/peer-ack.json" >/dev/null
+            acknowledged=$((acknowledged + 1))
+          done
+
+          gateway_call system-presence "$proof_tmp/after.json"
+          after_rows="$(jq 'length' "$proof_tmp/after.json")"
+          after_genuine="$(jq --arg instance "$self_instance" --arg text "$self_text" \
+            '[.[]|select(.instanceId==$instance and .text==$text and .mode=="gateway" and .reason=="self" and .deviceId==null)]|length' \
+            "$proof_tmp/after.json")"
+          after_forged="$(jq --arg host "$self_host" --arg instance "$self_instance" \
+            '[.[]|select(.deviceId==$host and .instanceId==$instance and .mode=="forged" and .reason=="self")]|length' \
+            "$proof_tmp/after.json")"
+          oldest_peer="$(jq '[.[]|select(.deviceId=="pr134740-peer-000")]|length' "$proof_tmp/after.json")"
+          newest_peer="$(jq '[.[]|select(.deviceId=="pr134740-peer-204")]|length' "$proof_tmp/after.json")"
+
+          test "$acknowledged" = "205"
+          test "$after_rows" = "200"
+          test "$after_genuine" = "1"
+          test "$after_forged" = "0"
+          test "$oldest_peer" = "0"
+          test "$newest_peer" = "1"
+
+          jq -n \
+            --arg head "$EXPECTED_PR_HEAD" \
+            --arg fingerprint "$self_fingerprint" \
+            --argjson beforeRows "$before_rows" \
+            --argjson collisionGenuine "$collision_genuine" \
+            --argjson collisionForged "$collision_forged" \
+            --argjson acknowledgements "$acknowledged" \
+            --argjson afterRows "$after_rows" \
+            --argjson afterGenuine "$after_genuine" \
+            --argjson afterForged "$after_forged" \
+            --argjson oldest "$oldest_peer" \
+            --argjson newest "$newest_peer" \
+            '{headSha:$head,runner:"github-hosted ubuntu-24.04",transport:"separate loopback Gateway process plus CLI WebSocket RPC",selfInstanceFingerprintSha256:$fingerprint,before:{rowCount:$beforeRows,genuineSelfCount:1},collision:{acknowledged:true,genuineSelfCount:$collisionGenuine,forgedStringKeyCount:$collisionForged},pressure:{peerUpdatesAcknowledged:$acknowledgements},after:{rowCount:$afterRows,genuineSelfCount:$afterGenuine,forgedCollisionCount:$afterForged,oldestPeerCount:$oldest,newestPeerCount:$newest},pass:true}' \
+            | tee "$GITHUB_WORKSPACE/proof-output/runtime-verdict.json"
+
+          printf 'REAL_GATEWAY_PROOF=PASS head=%s peerUpdates=%s finalRows=%s genuineSelf=%s forgedCollision=%s oldestPeer=%s newestPeer=%s\n' \
+            "$EXPECTED_PR_HEAD" "$acknowledged" "$after_rows" "$after_genuine" "$after_forged" "$oldest_peer" "$newest_peer"
+
+      - name: Upload redacted verdict
+        uses: actions/upload-artifact@043fb46d2fc27bad2f984749c76e56b553be8cb1 # v7
         with:
-          compression-level: 1
+          name: pr134740-real-gateway-proof
+          path: proof-output/runtime-verdict.json
           if-no-files-found: error
-          include-hidden-files: true
-          name: build-all-cache-v1-${{ runner.os }}-${{ runner.arch }}-node-22.23.2
-          overwrite: true
-          path: .artifacts/build-all-cache
-          retention-days: 14
+          retention-days: 30
