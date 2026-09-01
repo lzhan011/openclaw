@@ -1,122 +1,553 @@
-name: Node 22 Compat
+name: PR 134737 Exact-Head Gateway Rollback Proof
 
 on:
-  schedule:
-    - cron: "23 5 * * 1"
   workflow_dispatch:
 
 permissions:
-  actions: read
   contents: read
 
 jobs:
-  compat:
-    if: github.repository == 'openclaw/openclaw' || github.event_name == 'workflow_dispatch'
+  prove:
+    name: Real Gateway RPC rollback expiry
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
-      - name: Checkout repository
+      - name: Checkout proof branch without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
         with:
-          cache-mode: restore
-          node-version: "22.23.2"
-          install-bun: "false"
+          fetch-depth: 2
+          persist-credentials: false
 
-      - name: Resolve trusted declaration cache artifact
-        id: declaration_cache
+      - name: Bind proof source to PR head
         env:
-          ARTIFACT_NAME: build-all-cache-v1-Linux-X64-node-22.23.2
-          GH_TOKEN: ${{ github.token }}
+          EXPECTED_PR_HEAD: 6176af7bb2c084afe0a367551e30088fe64c56d6
         shell: bash
         run: |
           set -euo pipefail
-          if ! runs_json="$(
-            gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/workflows/node22-compat.yml/runs?branch=main&status=success&per_page=5" \
-              2>/dev/null
-          )"; then
-            echo "::warning::Unable to list trusted Node 22 runs; continuing cold."
-            exit 0
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PR_HEAD"
+          test "$(git diff --name-only "$EXPECTED_PR_HEAD" HEAD)" = ".github/workflows/node22-compat.yml"
+          if git config --get-regexp 'http\..*extraheader' >/dev/null; then
+            echo "checkout retained an HTTP credential" >&2
+            exit 1
           fi
+          printf 'proofSourceHead=%s\n' "$EXPECTED_PR_HEAD"
+          printf 'proofHarnessCommit=%s\n' "$(git rev-parse HEAD)"
+          printf 'sourceDelta=workflow-only\n'
 
-          while IFS=$'\t' read -r run_id source_sha; do
-            [[ "$run_id" =~ ^[1-9][0-9]*$ && "$source_sha" =~ ^[0-9a-f]{40}$ ]] || continue
-            if ! artifacts_json="$(
-              gh api \
-                "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=10" \
-                2>/dev/null
-            )"; then
-              continue
-            fi
-            artifact_id="$(
-              jq -r \
-                --arg name "$ARTIFACT_NAME" \
-                --arg run_id "$run_id" \
-                'first(.artifacts[] | select(
-                  .expired == false and
-                  .name == $name and
-                  (.workflow_run.id | tostring) == $run_id
-                ) | .id) // empty' \
-                <<<"$artifacts_json"
-            )"
-            if [[ ! "$artifact_id" =~ ^[1-9][0-9]*$ ]]; then
-              continue
-            fi
-            echo "artifact_id=$artifact_id" >> "$GITHUB_OUTPUT"
-            echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-            echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
-            exit 0
-          done < <(
-            jq -r '
-              .workflow_runs[] |
-              select(
-                .status == "completed" and
-                .conclusion == "success" and
-                .head_branch == "main" and
-                (.path | split("@")[0]) == ".github/workflows/node22-compat.yml" and
-                (.event == "schedule" or .event == "workflow_dispatch")
-              ) |
-              [.id, .head_sha] |
-              @tsv
-            ' <<<"$runs_json"
-          )
-
-      - name: Restore trusted declaration cache artifact
-        if: steps.declaration_cache.outputs.artifact_id != ''
-        continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - name: Setup public toolchain
+        uses: ./.github/actions/setup-node-env
         with:
-          artifact-ids: ${{ steps.declaration_cache.outputs.artifact_id }}
-          github-token: ${{ github.token }}
-          merge-multiple: true
-          path: .artifacts/build-all-cache
-          repository: ${{ github.repository }}
-          run-id: ${{ steps.declaration_cache.outputs.run_id }}
+          cache-mode: off
+          install-bun: "false"
+          install-trufflehog: "false"
 
-      - name: Configure Node test resources
-        run: echo "OPENCLAW_VITEST_MAX_WORKERS=2" >> "$GITHUB_ENV"
-
-      - name: Run Node 22 compatibility
-        env:
-          NODE_OPTIONS: --max-old-space-size=8192
+      - name: Install public wall-clock interposer
+        shell: bash
         run: |
-          pnpm build
-          pnpm ui:build
-          node openclaw.mjs --help
-          node openclaw.mjs status --json --timeout 1
-          pnpm test:build:singleton
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes libfaketime
+          fake_lib="$(dpkg -L libfaketime | awk '/\/libfaketime\.so\.1$/ { print; exit }')"
+          test -f "$fake_lib"
+          printf 'FAKETIME_LIBRARY=%s\n' "$fake_lib" >>"$GITHUB_ENV"
+          printf 'FAKETIME_PACKAGE_VERSION=%s\n' "$(dpkg-query -W -f='${Version}' libfaketime)" >>"$GITHUB_ENV"
 
-      - name: Publish trusted declaration cache artifact
-        if: success() && github.repository == 'openclaw/openclaw' && github.ref == 'refs/heads/main'
+      - name: Run real Gateway and WebSocket RPC rollback proof
+        env:
+          EXPECTED_PR_HEAD: 6176af7bb2c084afe0a367551e30088fe64c56d6
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          proof_tmp="$(mktemp -d)"
+          gateway_pid=""
+          proof_stage="initialization"
+          cleanup() {
+            rc=$?
+            trap - EXIT
+            if [[ "$rc" != "0" ]]; then
+              printf 'REAL_GATEWAY_ROLLBACK_PROOF=FAIL stage=%s exit=%s\n' "$proof_stage" "$rc"
+              if [[ -s "$proof_tmp/gateway.log" ]]; then
+                proof_host="$(hostname)"
+                {
+                  printf '%s\n' '--- gateway.log (sanitized tail) ---'
+                  tail -120 "$proof_tmp/gateway.log"
+                } | sed -E \
+                  -e "s#${proof_tmp}#[tmp]#g" \
+                  -e "s/${proof_host}/[runner-host]/g" \
+                  -e 's/[[:xdigit:]]{64}/[redacted-hex64]/g' \
+                  | tee "$GITHUB_WORKSPACE/proof-output/runtime-failure.log"
+              fi
+            fi
+            if [[ -n "$gateway_pid" ]]; then
+              kill "$gateway_pid" >/dev/null 2>&1 || true
+              wait "$gateway_pid" >/dev/null 2>&1 || true
+            fi
+            rm -rf -- "$proof_tmp"
+            exit "$rc"
+          }
+          trap cleanup EXIT
+
+          export HOME="$proof_tmp/home"
+          export OPENCLAW_STATE_DIR="$proof_tmp/state"
+          export OPENCLAW_CONFIG_PATH="$proof_tmp/state/openclaw.json"
+          export OPENCLAW_GATEWAY_URL="ws://127.0.0.1:28791"
+          export OPENCLAW_GATEWAY_TOKEN
+          OPENCLAW_GATEWAY_TOKEN="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))')"
+          export OPENCLAW_SKIP_CHANNELS=1
+          export OPENCLAW_SKIP_PROVIDERS=1
+          export OPENCLAW_SKIP_CRON=1
+          export OPENCLAW_SKIP_GMAIL_WATCHER=1
+          export OPENCLAW_SKIP_CANVAS_HOST=1
+          export OPENCLAW_SKIP_BROWSER_CONTROL_SERVER=1
+          export OPENCLAW_DISABLE_BUNDLED_PLUGINS=1
+          export PROOF_FAKETIME_FILE="$proof_tmp/faketime.rc"
+          mkdir -p "$HOME" "$OPENCLAW_STATE_DIR" "$GITHUB_WORKSPACE/proof-output"
+          printf '+0\n' >"$PROOF_FAKETIME_FILE"
+
+          proof_stage="gateway-start"
+          openclaw=(node --import tsx src/entry.ts)
+          env \
+            LD_PRELOAD="$FAKETIME_LIBRARY" \
+            FAKETIME_TIMESTAMP_FILE="$PROOF_FAKETIME_FILE" \
+            FAKETIME_NO_CACHE=1 \
+            FAKETIME_DONT_FAKE_MONOTONIC=1 \
+            "${openclaw[@]}" gateway run \
+              --allow-unconfigured \
+              --bind loopback --port 28791 \
+              --auth token --ws-log compact --verbose \
+              >"$proof_tmp/gateway.log" 2>&1 &
+          gateway_pid=$!
+
+          proof_stage="gateway-readiness"
+          ready=0
+          for _ in $(seq 1 120); do
+            if "${openclaw[@]}" gateway call health --json \
+              >"$proof_tmp/health.json" 2>"$proof_tmp/health.err"; then
+              ready=1
+              break
+            fi
+            sleep 0.5
+          done
+          if [[ "$ready" != "1" ]]; then
+            exit 1
+          fi
+          printf 'proofCheckpoint=gateway-ready\n'
+
+          proof_stage="real-client-rollback"
+          node --import tsx --input-type=module <<'NODE'
+          import { readFile, writeFile } from "node:fs/promises";
+          import path from "node:path";
+          import { pathToFileURL } from "node:url";
+          import { setTimeout as delay } from "node:timers/promises";
+
+          const workspace = process.env.GITHUB_WORKSPACE;
+          const token = process.env.OPENCLAW_GATEWAY_TOKEN;
+          const url = process.env.OPENCLAW_GATEWAY_URL;
+          const head = process.env.EXPECTED_PR_HEAD;
+          const faketimeFile = process.env.PROOF_FAKETIME_FILE;
+          const faketimeVersion = process.env.FAKETIME_PACKAGE_VERSION;
+          if (!workspace || !token || !url || !head || !faketimeFile || !faketimeVersion) {
+            throw new Error("proof environment is incomplete");
+          }
+
+          const sourceUrl = pathToFileURL(path.join(workspace, "src/gateway/call.ts")).href;
+          const { callGateway } = await import(sourceUrl);
+          const rpc = async (method, params) =>
+            await callGateway({
+              method,
+              params,
+              url,
+              token,
+              timeoutMs: 10_000,
+              sharedStateMode: "read-only",
+            });
+          const preRollbackInstanceId = "pr134737-pre-rollback-proof";
+          const rollbackCreatedInstanceId = "pr134737-rollback-created-proof";
+          const pressureInstanceId = "pr134737-clock-rollback-pressure";
+          const rowsFor = (rows, instanceId) =>
+            rows.filter((entry) => entry.instanceId === instanceId);
+          const canonicalSelfRows = (rows) =>
+            rows.filter(
+              (entry) =>
+                entry.reason === "self" && entry.mode === "gateway" && entry.deviceId == null,
+            );
+          const snapshot = async () => {
+            const rows = await rpc("system-presence");
+            if (!Array.isArray(rows)) {
+              throw new Error("system-presence result was not an array");
+            }
+            return rows;
+          };
+          const kernelUptimeSeconds = async () =>
+            Number.parseFloat((await readFile("/proc/uptime", "utf8")).split(/\s+/, 1)[0]);
+
+          const preRollbackAck = await rpc("system-event", {
+            text: "Node: pre-rollback-proof (192.0.2.10) · app proof · last input 0s ago · mode ui · reason heartbeat",
+            instanceId: preRollbackInstanceId,
+            host: "pre-rollback-proof",
+            ip: "192.0.2.10",
+            mode: "ui",
+            reason: "heartbeat",
+            version: "proof",
+          });
+          if (preRollbackAck?.ok !== true) {
+            throw new Error("Gateway did not acknowledge the pre-rollback presence update");
+          }
+
+          const before = await snapshot();
+          const beforePreRollback = rowsFor(before, preRollbackInstanceId);
+          const beforeSelf = canonicalSelfRows(before);
+          if (beforePreRollback.length !== 1 || beforeSelf.length !== 1) {
+            throw new Error(
+              `unexpected initial snapshot: preRollback=${beforePreRollback.length} self=${beforeSelf.length}`,
+            );
+          }
+          const preRollbackPublicTs = beforePreRollback[0]?.ts;
+          if (typeof preRollbackPublicTs !== "number") {
+            throw new Error("pre-rollback presence row lacked a public timestamp");
+          }
+          console.log("proofCheckpoint=before-rollback preRollback=1 canonicalSelf=1");
+
+          await writeFile(faketimeFile, "-1h\n", "utf8");
+          let firstRollbackSelfTs = 0;
+          let firstRollbackDeltaMs = 0;
+          for (let attempt = 0; attempt < 120; attempt += 1) {
+            const rolled = await snapshot();
+            const self = canonicalSelfRows(rolled);
+            if (self.length === 1 && typeof self[0]?.ts === "number") {
+              firstRollbackSelfTs = self[0].ts;
+              firstRollbackDeltaMs = preRollbackPublicTs - firstRollbackSelfTs;
+              if (firstRollbackDeltaMs > 3_500_000) {
+                break;
+              }
+            }
+            await delay(250);
+          }
+          if (firstRollbackDeltaMs <= 3_500_000) {
+            throw new Error(
+              `Gateway wall clock did not roll back by one hour: ${firstRollbackDeltaMs}`,
+            );
+          }
+
+          const rollbackCreatedAt = performance.now();
+          const rollbackCreatedUptime = await kernelUptimeSeconds();
+          const rollbackCreatedAck = await rpc("system-event", {
+            text: "Node: rollback-created-proof (192.0.2.13) · app proof · last input 0s ago · mode ui · reason heartbeat",
+            instanceId: rollbackCreatedInstanceId,
+            host: "rollback-created-proof",
+            ip: "192.0.2.13",
+            mode: "ui",
+            reason: "heartbeat",
+            version: "proof",
+          });
+          if (rollbackCreatedAck?.ok !== true) {
+            throw new Error("Gateway did not acknowledge the rollback-created presence update");
+          }
+          const afterRollbackCreate = await snapshot();
+          const immediatePreRollback = rowsFor(afterRollbackCreate, preRollbackInstanceId);
+          const immediateRollbackCreated = rowsFor(
+            afterRollbackCreate,
+            rollbackCreatedInstanceId,
+          );
+          const immediateSelf = canonicalSelfRows(afterRollbackCreate);
+          if (
+            immediatePreRollback.length !== 1 ||
+            immediateRollbackCreated.length !== 1 ||
+            immediateSelf.length !== 1
+          ) {
+            throw new Error(
+              `unexpected rollback-created snapshot: preRollback=${immediatePreRollback.length} rollbackCreated=${immediateRollbackCreated.length} self=${immediateSelf.length}`,
+            );
+          }
+          const rollbackCreatedPublicTs = immediateRollbackCreated[0]?.ts;
+          if (typeof rollbackCreatedPublicTs !== "number") {
+            throw new Error("rollback-created row lacked a public timestamp");
+          }
+          console.log(
+            `proofCheckpoint=created-during-rollback rollbackSeconds=${Math.round(firstRollbackDeltaMs / 1000)} preRollback=1 rollbackCreated=1 canonicalSelf=1`,
+          );
+
+          const recoveryWaitMs = 61_000;
+          await delay(recoveryWaitMs);
+          await writeFile(faketimeFile, "+0\n", "utf8");
+          let recoveredBeforeTtl;
+          let recoveredSelf;
+          for (let attempt = 0; attempt < 120; attempt += 1) {
+            const recovered = await snapshot();
+            const self = canonicalSelfRows(recovered);
+            if (
+              self.length === 1 &&
+              typeof self[0]?.ts === "number" &&
+              self[0].ts >= preRollbackPublicTs
+            ) {
+              recoveredBeforeTtl = recovered;
+              recoveredSelf = self[0];
+              break;
+            }
+            await delay(250);
+          }
+          if (!recoveredBeforeTtl || !recoveredSelf?.host || !recoveredSelf.instanceId) {
+            throw new Error("Gateway wall clock did not recover before the TTL boundary");
+          }
+          const recoveredPreRollback = rowsFor(recoveredBeforeTtl, preRollbackInstanceId);
+          const recoveredRollbackCreated = rowsFor(
+            recoveredBeforeTtl,
+            rollbackCreatedInstanceId,
+          );
+          const recoveryUptimeElapsedSeconds =
+            (await kernelUptimeSeconds()) - rollbackCreatedUptime;
+          if (
+            recoveryUptimeElapsedSeconds >= 300 ||
+            recoveredPreRollback.length !== 1 ||
+            recoveredRollbackCreated.length !== 1 ||
+            recoveredRollbackCreated[0]?.ts !== rollbackCreatedPublicTs
+          ) {
+            throw new Error(
+              `rollback-created recovery phase failed: uptime=${recoveryUptimeElapsedSeconds} preRollback=${recoveredPreRollback.length} rollbackCreated=${recoveredRollbackCreated.length} publicTsPreserved=${recoveredRollbackCreated[0]?.ts === rollbackCreatedPublicTs}`,
+            );
+          }
+          console.log(
+            `proofCheckpoint=recovered-before-ttl uptimeSeconds=${recoveryUptimeElapsedSeconds.toFixed(3)} preRollback=1 rollbackCreated=1 rollbackCreatedPublicTimestampPreserved=true`,
+          );
+
+          await writeFile(faketimeFile, "-1h\n", "utf8");
+          let expiryRollbackDeltaMs = 0;
+          for (let attempt = 0; attempt < 120; attempt += 1) {
+            const rolled = await snapshot();
+            const self = canonicalSelfRows(rolled);
+            if (self.length === 1 && typeof self[0]?.ts === "number") {
+              expiryRollbackDeltaMs = recoveredSelf.ts - self[0].ts;
+              if (expiryRollbackDeltaMs > 3_500_000) {
+                break;
+              }
+            }
+            await delay(250);
+          }
+          if (expiryRollbackDeltaMs <= 3_500_000) {
+            throw new Error("Gateway wall clock did not roll back for the expiry phase");
+          }
+
+          const realTtlWaitSeconds = 306;
+          while ((await kernelUptimeSeconds()) - rollbackCreatedUptime <= realTtlWaitSeconds) {
+            await delay(5_000);
+          }
+          const afterTtl = await snapshot();
+          const afterPreRollback = rowsFor(afterTtl, preRollbackInstanceId);
+          const afterRollbackCreated = rowsFor(afterTtl, rollbackCreatedInstanceId);
+          const afterSelf = canonicalSelfRows(afterTtl);
+          const monotonicElapsedMs = performance.now() - rollbackCreatedAt;
+          const kernelUptimeElapsedSeconds =
+            (await kernelUptimeSeconds()) - rollbackCreatedUptime;
+          const finalSelfTs = afterSelf[0]?.ts;
+          const finalWallStillBehindMs =
+            typeof finalSelfTs === "number"
+              ? recoveredSelf.ts - finalSelfTs
+              : Number.NEGATIVE_INFINITY;
+          const health = await rpc("health");
+          const gatewayHealthy = health != null && typeof health === "object";
+          const ttlPass =
+            monotonicElapsedMs > 300_000 &&
+            kernelUptimeElapsedSeconds > 300 &&
+            afterPreRollback.length === 0 &&
+            afterRollbackCreated.length === 0 &&
+            afterSelf.length === 1 &&
+            finalWallStillBehindMs > 3_000_000 &&
+            gatewayHealthy;
+
+          if (!ttlPass) {
+            throw new Error("real-time rollback TTL phase failed");
+          }
+
+          await writeFile(faketimeFile, "+0\n", "utf8");
+          recoveredSelf = undefined;
+          for (let attempt = 0; attempt < 120; attempt += 1) {
+            const recovered = await snapshot();
+            const self = canonicalSelfRows(recovered);
+            if (
+              self.length === 1 &&
+              typeof self[0]?.ts === "number" &&
+              self[0].ts >= preRollbackPublicTs
+            ) {
+              recoveredSelf = self[0];
+              break;
+            }
+            await delay(250);
+          }
+          if (!recoveredSelf?.host || !recoveredSelf.instanceId) {
+            throw new Error("Gateway wall clock did not recover before pressure phase");
+          }
+
+          const forgedText = "caller-controlled gateway row";
+          const forgedAck = await rpc("system-event", {
+            text: forgedText,
+            deviceId: recoveredSelf.host,
+            instanceId: recoveredSelf.instanceId,
+            host: recoveredSelf.host,
+            mode: "gateway",
+            reason: "self",
+            version: "proof",
+          });
+          if (forgedAck?.ok !== true) {
+            throw new Error("Gateway did not acknowledge the self-like peer");
+          }
+          const pressureAck = await rpc("system-event", {
+            text: "Node: pressure-old (192.0.2.11) · app proof · last input 0s ago · mode ui · reason heartbeat",
+            instanceId: pressureInstanceId,
+            host: "pressure-old",
+            ip: "192.0.2.11",
+            mode: "ui",
+            reason: "heartbeat",
+            version: "proof",
+          });
+          if (pressureAck?.ok !== true) {
+            throw new Error("Gateway did not acknowledge the pressure row");
+          }
+
+          await writeFile(faketimeFile, "-1h\n", "utf8");
+          let pressureRollbackDeltaMs = 0;
+          for (let attempt = 0; attempt < 120; attempt += 1) {
+            const rolled = await snapshot();
+            const self = canonicalSelfRows(rolled);
+            if (self.length === 1 && typeof self[0]?.ts === "number") {
+              pressureRollbackDeltaMs = recoveredSelf.ts - self[0].ts;
+              if (pressureRollbackDeltaMs > 3_500_000) {
+                break;
+              }
+            }
+            await delay(250);
+          }
+          if (pressureRollbackDeltaMs <= 3_500_000) {
+            throw new Error("Gateway wall clock did not roll back for pressure phase");
+          }
+
+          const freshPrefix = "pr134737-pressure-fresh-";
+          for (let index = 0; index < 205; index += 1) {
+            const instanceId = `${freshPrefix}${index}`;
+            const ack = await rpc("system-event", {
+              text: `Node: pressure-${index} (192.0.2.12) · app proof · last input 0s ago · mode ui · reason heartbeat`,
+              instanceId,
+              host: `pressure-${index}`,
+              ip: "192.0.2.12",
+              mode: "ui",
+              reason: "heartbeat",
+              version: "proof",
+            });
+            if (ack?.ok !== true) {
+              throw new Error(`Gateway rejected pressure row ${index}`);
+            }
+          }
+
+          const bounded = await snapshot();
+          const boundedSelf = canonicalSelfRows(bounded);
+          const boundedFresh = bounded.filter((entry) => entry.instanceId?.startsWith(freshPrefix));
+          const forgedCount = bounded.filter((entry) => entry.text === forgedText).length;
+          const pressureOldCount = bounded.filter(
+            (entry) => entry.instanceId === pressureInstanceId,
+          ).length;
+          const capacityPass =
+            bounded.length === 200 &&
+            boundedSelf.length === 1 &&
+            boundedFresh.length === 199 &&
+            forgedCount === 0 &&
+            pressureOldCount === 0;
+          if (!capacityPass) {
+            throw new Error(
+              `rollback pressure phase failed: total=${bounded.length} self=${boundedSelf.length} fresh=${boundedFresh.length} forged=${forgedCount} old=${pressureOldCount}`,
+            );
+          }
+
+          const pass = ttlPass && capacityPass;
+
+          const trace = [
+            {
+              phase: "beforeRollback",
+              preRollbackRowCount: beforePreRollback.length,
+              canonicalSelfCount: beforeSelf.length,
+              publicTimestampCaptured: true,
+            },
+            {
+              phase: "createdDuringRollback",
+              gatewayWallRollbackSeconds: Math.round(firstRollbackDeltaMs / 1000),
+              preRollbackRowCount: immediatePreRollback.length,
+              rollbackCreatedRowCount: immediateRollbackCreated.length,
+              canonicalSelfCount: immediateSelf.length,
+              rollbackCreatedPublicTimestampCaptured: true,
+            },
+            {
+              phase: "recoveredBeforeTtl",
+              kernelUptimeElapsedSeconds: Number(recoveryUptimeElapsedSeconds.toFixed(3)),
+              preRollbackRowCount: recoveredPreRollback.length,
+              rollbackCreatedRowCount: recoveredRollbackCreated.length,
+              rollbackCreatedPublicTimestampPreserved:
+                recoveredRollbackCreated[0]?.ts === rollbackCreatedPublicTs,
+            },
+            {
+              phase: "afterRealTtl",
+              realMonotonicElapsedSeconds: Number((monotonicElapsedMs / 1000).toFixed(3)),
+              kernelUptimeElapsedSeconds: Number(kernelUptimeElapsedSeconds.toFixed(3)),
+              gatewayWallStillBehindSeconds: Math.round(finalWallStillBehindMs / 1000),
+              preRollbackRowCount: afterPreRollback.length,
+              rollbackCreatedRowCount: afterRollbackCreated.length,
+              canonicalSelfCount: afterSelf.length,
+              gatewayHealthy,
+            },
+            {
+              phase: "rollbackCapacityPressure",
+              gatewayWallRollbackSeconds: Math.round(pressureRollbackDeltaMs / 1000),
+              totalPresenceCount: bounded.length,
+              canonicalSelfCount: boundedSelf.length,
+              freshPeerCount: boundedFresh.length,
+              forgedSelfLikePeerCount: forgedCount,
+              stalePreRollbackPeerCount: pressureOldCount,
+            },
+          ];
+          const verdict = {
+            headSha: head,
+            runner: "github-hosted ubuntu-24.04",
+            transport: "separate loopback Gateway process plus real callGateway WebSocket client",
+            wallClockControl: {
+              package: "libfaketime",
+              packageVersion: faketimeVersion,
+              timestampFileReload: true,
+              monotonicClockUnmodified: true,
+            },
+            scenario: {
+              requestedRollbackSeconds: 3600,
+              recoveryWaitSeconds: recoveryWaitMs / 1000,
+              totalUptimeTtlWaitSeconds: realTtlWaitSeconds,
+              preRollbackUpdateAcknowledged: true,
+              rollbackCreatedUpdateAcknowledged: true,
+              pressurePeerUpdatesAcknowledged: 205,
+              selfLikePeerSubmittedThroughRpc: true,
+            },
+            observed: trace,
+            pass,
+          };
+          await writeFile(
+            path.join(workspace, "proof-output/runtime-trace.jsonl"),
+            `${trace.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+            "utf8",
+          );
+          await writeFile(
+            path.join(workspace, "proof-output/runtime-verdict.json"),
+            `${JSON.stringify(verdict, null, 2)}\n`,
+            "utf8",
+          );
+          console.log(JSON.stringify(verdict, null, 2));
+          console.log(
+            `REAL_GATEWAY_ROLLBACK_PROOF=${pass ? "PASS" : "FAIL"} head=${head} realElapsedSeconds=${(monotonicElapsedMs / 1000).toFixed(3)} rollbackCreatedSurvivedRecovery=${recoveredRollbackCreated.length === 1} staleRowsAfterTtl=${afterPreRollback.length + afterRollbackCreated.length} canonicalSelf=${afterSelf.length} gatewayHealthy=${gatewayHealthy}`,
+          );
+          if (!pass) {
+            process.exitCode = 1;
+          }
+          NODE
+
+      - name: Upload redacted verdict
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          compression-level: 1
+          name: pr134737-real-gateway-rollback-proof
+          path: proof-output/
           if-no-files-found: error
-          include-hidden-files: true
-          name: build-all-cache-v1-${{ runner.os }}-${{ runner.arch }}-node-22.23.2
-          overwrite: true
-          path: .artifacts/build-all-cache
-          retention-days: 14
+          retention-days: 30
