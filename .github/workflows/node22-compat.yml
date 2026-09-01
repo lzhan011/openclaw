@@ -178,7 +178,7 @@ jobs:
 
       - name: Publish auth order proof
         if: always() && inputs.proof_mode == 'auth-order'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0 # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           if-no-files-found: error
           name: auth-order-proof-${{ inputs.target_ref }}-${{ inputs.expected_outcome }}
