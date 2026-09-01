@@ -1,122 +1,282 @@
-name: Node 22 Compat
+name: PR 134740 Real Gateway Proof
 
 on:
-  schedule:
-    - cron: "23 5 * * 1"
   workflow_dispatch:
 
 permissions:
-  actions: read
   contents: read
 
 jobs:
-  compat:
-    if: github.repository == 'openclaw/openclaw' || github.event_name == 'workflow_dispatch'
+  prove:
+    name: Real Gateway RPC presence bound
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
-      - name: Checkout repository
+      - name: Checkout proof branch without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
         with:
-          cache-mode: restore
-          node-version: "22.23.2"
-          install-bun: "false"
+          fetch-depth: 2
+          persist-credentials: false
 
-      - name: Resolve trusted declaration cache artifact
-        id: declaration_cache
+      - name: Bind proof source to PR head
         env:
-          ARTIFACT_NAME: build-all-cache-v1-Linux-X64-node-22.23.2
-          GH_TOKEN: ${{ github.token }}
+          EXPECTED_PR_HEAD: 5d0a8224ddb94cc21f64201bda12cc705bc624bd
         shell: bash
         run: |
           set -euo pipefail
-          if ! runs_json="$(
-            gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/workflows/node22-compat.yml/runs?branch=main&status=success&per_page=5" \
-              2>/dev/null
-          )"; then
-            echo "::warning::Unable to list trusted Node 22 runs; continuing cold."
-            exit 0
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PR_HEAD"
+          test "$(git diff --name-only "$EXPECTED_PR_HEAD" HEAD)" = ".github/workflows/node22-compat.yml"
+          if git config --get-regexp 'http\..*extraheader' >/dev/null; then
+            echo "checkout retained an HTTP credential" >&2
+            exit 1
           fi
+          printf 'proofSourceHead=%s\n' "$EXPECTED_PR_HEAD"
+          printf 'proofHarnessCommit=%s\n' "$(git rev-parse HEAD)"
+          printf 'sourceDelta=workflow-only\n'
 
-          while IFS=$'\t' read -r run_id source_sha; do
-            [[ "$run_id" =~ ^[1-9][0-9]*$ && "$source_sha" =~ ^[0-9a-f]{40}$ ]] || continue
-            if ! artifacts_json="$(
-              gh api \
-                "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=10" \
-                2>/dev/null
-            )"; then
-              continue
-            fi
-            artifact_id="$(
-              jq -r \
-                --arg name "$ARTIFACT_NAME" \
-                --arg run_id "$run_id" \
-                'first(.artifacts[] | select(
-                  .expired == false and
-                  .name == $name and
-                  (.workflow_run.id | tostring) == $run_id
-                ) | .id) // empty' \
-                <<<"$artifacts_json"
-            )"
-            if [[ ! "$artifact_id" =~ ^[1-9][0-9]*$ ]]; then
-              continue
-            fi
-            echo "artifact_id=$artifact_id" >> "$GITHUB_OUTPUT"
-            echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-            echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
-            exit 0
-          done < <(
-            jq -r '
-              .workflow_runs[] |
-              select(
-                .status == "completed" and
-                .conclusion == "success" and
-                .head_branch == "main" and
-                (.path | split("@")[0]) == ".github/workflows/node22-compat.yml" and
-                (.event == "schedule" or .event == "workflow_dispatch")
-              ) |
-              [.id, .head_sha] |
-              @tsv
-            ' <<<"$runs_json"
-          )
-
-      - name: Restore trusted declaration cache artifact
-        if: steps.declaration_cache.outputs.artifact_id != ''
-        continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - name: Setup public toolchain
+        uses: ./.github/actions/setup-node-env
         with:
-          artifact-ids: ${{ steps.declaration_cache.outputs.artifact_id }}
-          github-token: ${{ github.token }}
-          merge-multiple: true
-          path: .artifacts/build-all-cache
-          repository: ${{ github.repository }}
-          run-id: ${{ steps.declaration_cache.outputs.run_id }}
+          cache-mode: off
+          install-bun: "false"
+          install-trufflehog: "false"
 
-      - name: Configure Node test resources
-        run: echo "OPENCLAW_VITEST_MAX_WORKERS=2" >> "$GITHUB_ENV"
-
-      - name: Run Node 22 compatibility
+      - name: Run real Gateway and WebSocket RPC proof
         env:
-          NODE_OPTIONS: --max-old-space-size=8192
+          EXPECTED_PR_HEAD: 5d0a8224ddb94cc21f64201bda12cc705bc624bd
+        shell: bash
         run: |
-          pnpm build
-          pnpm ui:build
-          node openclaw.mjs --help
-          node openclaw.mjs status --json --timeout 1
-          pnpm test:build:singleton
+          set -Eeuo pipefail
 
-      - name: Publish trusted declaration cache artifact
-        if: success() && github.repository == 'openclaw/openclaw' && github.ref == 'refs/heads/main'
+          proof_tmp="$(mktemp -d)"
+          gateway_pid=""
+          proof_stage="initialization"
+          cleanup() {
+            rc=$?
+            trap - EXIT
+            if [[ "$rc" != "0" ]]; then
+              printf 'REAL_GATEWAY_PROOF=FAIL stage=%s exit=%s\n' "$proof_stage" "$rc"
+            fi
+            if [[ -n "$gateway_pid" ]]; then
+              kill "$gateway_pid" >/dev/null 2>&1 || true
+              wait "$gateway_pid" >/dev/null 2>&1 || true
+            fi
+            rm -rf -- "$proof_tmp"
+            exit "$rc"
+          }
+          trap cleanup EXIT
+
+          export HOME="$proof_tmp/home"
+          export OPENCLAW_STATE_DIR="$proof_tmp/state"
+          export OPENCLAW_CONFIG_PATH="$proof_tmp/state/openclaw.json"
+          export OPENCLAW_GATEWAY_TOKEN
+          OPENCLAW_GATEWAY_TOKEN="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))')"
+          export OPENCLAW_SKIP_CHANNELS=1
+          export OPENCLAW_SKIP_PROVIDERS=1
+          export OPENCLAW_SKIP_CRON=1
+          export OPENCLAW_SKIP_GMAIL_WATCHER=1
+          export OPENCLAW_SKIP_CANVAS_HOST=1
+          export OPENCLAW_SKIP_BROWSER_CONTROL_SERVER=1
+          export OPENCLAW_DISABLE_BUNDLED_PLUGINS=1
+          mkdir -p "$HOME" "$OPENCLAW_STATE_DIR" "$GITHUB_WORKSPACE/proof-output"
+
+          proof_stage="gateway-start"
+          export OPENCLAW_GATEWAY_URL="ws://127.0.0.1:28789"
+          openclaw=(node --import tsx src/entry.ts)
+          "${openclaw[@]}" gateway run \
+            --allow-unconfigured \
+            --bind loopback --port 28789 \
+            --auth token --ws-log compact --verbose \
+            >"$proof_tmp/gateway.log" 2>&1 &
+          gateway_pid=$!
+
+          proof_stage="gateway-readiness"
+          ready=0
+          for _ in $(seq 1 120); do
+            if "${openclaw[@]}" gateway call health --json \
+              >"$proof_tmp/health.json" 2>"$proof_tmp/health.err"; then
+              ready=1
+              break
+            fi
+            sleep 0.5
+          done
+          if [[ "$ready" != "1" ]]; then
+            proof_host="$(hostname)"
+            {
+              printf '%s\n' '--- gateway.log (sanitized tail) ---'
+              tail -120 "$proof_tmp/gateway.log"
+              printf '%s\n' '--- health.json (sanitized tail) ---'
+              tail -40 "$proof_tmp/health.json"
+              printf '%s\n' '--- health.err (sanitized tail) ---'
+              tail -40 "$proof_tmp/health.err"
+            } | sed -E \
+              -e "s#${proof_tmp}#[tmp]#g" \
+              -e "s/${proof_host}/[runner-host]/g" \
+              -e 's/[[:xdigit:]]{64}/[redacted-hex64]/g' \
+              | tee "$GITHUB_WORKSPACE/proof-output/readiness-failure.log"
+            exit 1
+          fi
+          printf 'proofCheckpoint=gateway-ready\n'
+
+          proof_stage="real-client-pressure"
+          node --import tsx --input-type=module <<'NODE'
+          import { createHash } from "node:crypto";
+          import { writeFile } from "node:fs/promises";
+          import path from "node:path";
+          import { pathToFileURL } from "node:url";
+
+          const workspace = process.env.GITHUB_WORKSPACE;
+          const token = process.env.OPENCLAW_GATEWAY_TOKEN;
+          const url = process.env.OPENCLAW_GATEWAY_URL;
+          const head = process.env.EXPECTED_PR_HEAD;
+          if (!workspace || !token || !url || !head) {
+            throw new Error("proof environment is incomplete");
+          }
+          const sourceUrl = pathToFileURL(path.join(workspace, "src/gateway/call.ts")).href;
+          const { callGateway } = await import(sourceUrl);
+          const rpc = async (method, params) =>
+            await callGateway({
+              method,
+              params,
+              url,
+              token,
+              timeoutMs: 10_000,
+              sharedStateMode: "read-only",
+            });
+          const genuineSelfRows = (rows, instanceId, text) =>
+            rows.filter(
+              (entry) =>
+                entry.instanceId === instanceId &&
+                entry.text === text &&
+                entry.mode === "gateway" &&
+                entry.reason === "self" &&
+                entry.deviceId == null,
+            );
+          const forgedRows = (rows, host, instanceId) =>
+            rows.filter(
+              (entry) =>
+                entry.deviceId === host &&
+                entry.instanceId === instanceId &&
+                entry.mode === "forged" &&
+                entry.reason === "self",
+            );
+
+          const before = await rpc("system-presence");
+          if (!Array.isArray(before)) {
+            throw new Error("initial system-presence result was not an array");
+          }
+          const initialSelf = before.filter(
+            (entry) =>
+              entry.reason === "self" && entry.mode === "gateway" && entry.deviceId == null,
+          );
+          if (initialSelf.length !== 1) {
+            throw new Error(`expected one canonical self row, received ${initialSelf.length}`);
+          }
+          const self = initialSelf[0];
+          if (!self?.host || !self.instanceId || !self.text) {
+            throw new Error("canonical self row lacked its runtime identity fields");
+          }
+          const selfFingerprint = createHash("sha256").update(self.instanceId).digest("hex");
+          console.log(`proofCheckpoint=initial-snapshot rows=${before.length} genuineSelf=1`);
+
+          const collisionAck = await rpc("system-event", {
+            text: `Node: ${self.host} (127.0.0.254) · app 0.0.0 · last input 0s ago · mode forged · reason self`,
+            deviceId: self.host,
+            instanceId: self.instanceId,
+            host: self.host,
+            ip: "127.0.0.254",
+            mode: "forged",
+            reason: "self",
+            version: "0.0.0",
+          });
+          if (collisionAck?.ok !== true) {
+            throw new Error("Gateway did not acknowledge the collision update");
+          }
+          const afterCollision = await rpc("system-presence");
+          const collisionGenuine = genuineSelfRows(afterCollision, self.instanceId, self.text).length;
+          const collisionForged = forgedRows(afterCollision, self.host, self.instanceId).length;
+          if (collisionGenuine !== 1 || collisionForged !== 1) {
+            throw new Error(
+              `unexpected collision snapshot: genuine=${collisionGenuine} forged=${collisionForged}`,
+            );
+          }
+          console.log(
+            `proofCheckpoint=collision genuineSelf=${collisionGenuine} forgedStringKey=${collisionForged}`,
+          );
+
+          let acknowledged = 0;
+          for (let index = 0; index <= 204; index += 1) {
+            const suffix = String(index).padStart(3, "0");
+            const peer = `pr134740-peer-${suffix}`;
+            const instanceId = `pr134740-instance-${suffix}`;
+            const ack = await rpc("system-event", {
+              text: `Node: ${peer} (127.0.0.2) · app 1.0.0 · last input 0s ago · mode qa · reason connect`,
+              deviceId: peer,
+              instanceId,
+              host: peer,
+              ip: "127.0.0.2",
+              mode: "qa",
+              reason: "connect",
+              version: "1.0.0",
+            });
+            if (ack?.ok !== true) {
+              throw new Error(`Gateway did not acknowledge peer update ${index}`);
+            }
+            acknowledged += 1;
+            if (acknowledged % 25 === 0) {
+              console.log(`proofCheckpoint=peer-updates acknowledged=${acknowledged}`);
+            }
+          }
+
+          const after = await rpc("system-presence");
+          const afterGenuine = genuineSelfRows(after, self.instanceId, self.text).length;
+          const afterForged = forgedRows(after, self.host, self.instanceId).length;
+          const oldestPeer = after.filter((entry) => entry.deviceId === "pr134740-peer-000").length;
+          const newestPeer = after.filter((entry) => entry.deviceId === "pr134740-peer-204").length;
+          const pass =
+            acknowledged === 205 &&
+            after.length === 200 &&
+            afterGenuine === 1 &&
+            afterForged === 0 &&
+            oldestPeer === 0 &&
+            newestPeer === 1;
+          const verdict = {
+            headSha: head,
+            runner: "github-hosted ubuntu-24.04",
+            transport: "separate loopback Gateway process plus real callGateway WebSocket client",
+            selfInstanceFingerprintSha256: selfFingerprint,
+            before: { rowCount: before.length, genuineSelfCount: 1 },
+            collision: {
+              acknowledged: true,
+              genuineSelfCount: collisionGenuine,
+              forgedStringKeyCount: collisionForged,
+            },
+            pressure: { peerUpdatesAcknowledged: acknowledged },
+            after: {
+              rowCount: after.length,
+              genuineSelfCount: afterGenuine,
+              forgedCollisionCount: afterForged,
+              oldestPeerCount: oldestPeer,
+              newestPeerCount: newestPeer,
+            },
+            pass,
+          };
+          const verdictPath = path.join(workspace, "proof-output/runtime-verdict.json");
+          await writeFile(verdictPath, `${JSON.stringify(verdict, null, 2)}\n`, "utf8");
+          console.log(JSON.stringify(verdict, null, 2));
+          console.log(
+            `REAL_GATEWAY_PROOF=${pass ? "PASS" : "FAIL"} head=${head} peerUpdates=${acknowledged} finalRows=${after.length} genuineSelf=${afterGenuine} forgedCollision=${afterForged} oldestPeer=${oldestPeer} newestPeer=${newestPeer}`,
+          );
+          if (!pass) {
+            process.exitCode = 1;
+          }
+          NODE
+
+      - name: Upload redacted verdict
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          compression-level: 1
+          name: pr134740-real-gateway-proof
+          path: proof-output/
           if-no-files-found: error
-          include-hidden-files: true
-          name: build-all-cache-v1-${{ runner.os }}-${{ runner.arch }}-node-22.23.2
-          overwrite: true
-          path: .artifacts/build-all-cache
-          retention-days: 14
+          retention-days: 30
