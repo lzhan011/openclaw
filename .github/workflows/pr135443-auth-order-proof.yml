@@ -1,0 +1,222 @@
+name: PR 135443 Auth Order Real Behavior Proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Full commit SHA to test
+        required: true
+        type: string
+      expected_sha:
+        description: Full commit SHA expected after checkout
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  auth-order-real-behavior:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact target
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.target_ref }}
+          persist-credentials: false
+
+      - name: Verify exact target
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$EXPECTED_SHA"
+          test "$(git status --porcelain=v1)" = ""
+
+      - name: Setup Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          cache-mode: restore
+          node-version: "22.22.3"
+          install-bun: "false"
+
+      - name: Exercise real CLI and SQLite contention boundary
+        env:
+          CI: "1"
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          SYNTHETIC_API_KEY: synthetic-proof-input-not-a-secret
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export HOME="$RUNNER_TEMP/pr135443-home"
+          export OPENCLAW_STATE_DIR="$RUNNER_TEMP/pr135443-state"
+          export OPENCLAW_CONFIG_PATH="$OPENCLAW_STATE_DIR/openclaw.json"
+          proof_dir="$RUNNER_TEMP/pr135443-proof"
+          mkdir -p "$HOME" "$OPENCLAW_STATE_DIR" "$proof_dir"
+
+          printf '%s\n' "$SYNTHETIC_API_KEY" |
+            pnpm openclaw models auth paste-api-key \
+              --provider synthetic \
+              --profile-id synthetic:old \
+              >"$RUNNER_TEMP/seed.log" 2>&1
+          pnpm openclaw models auth order set \
+            --provider synthetic \
+            synthetic:old \
+            >"$RUNNER_TEMP/order-seed.log" 2>&1
+
+          agent_db="$OPENCLAW_STATE_DIR/agents/main/agent/openclaw-agent.sqlite"
+          test -f "$agent_db"
+          export AGENT_DB="$agent_db"
+          lock_log="$RUNNER_TEMP/order-lock.log"
+          node --no-warnings --input-type=module - >"$lock_log" 2>&1 <<'NODE' &
+          import { DatabaseSync } from "node:sqlite";
+
+          const database = new DatabaseSync(process.env.AGENT_DB);
+          database.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE;");
+          process.stdout.write("LOCK_READY\n");
+          const keepAlive = setInterval(() => {}, 1_000);
+          const close = () => {
+            clearInterval(keepAlive);
+            try {
+              database.exec("ROLLBACK;");
+            } catch {}
+            database.close();
+            process.exit(0);
+          };
+          process.on("SIGTERM", close);
+          process.on("SIGINT", close);
+          NODE
+          lock_pid=$!
+          cleanup_lock() {
+            if kill -0 "$lock_pid" 2>/dev/null; then
+              kill -TERM "$lock_pid"
+              wait "$lock_pid" || true
+            fi
+          }
+          trap cleanup_lock EXIT
+
+          for _ in $(seq 1 100); do
+            grep -q '^LOCK_READY$' "$lock_log" && break
+            kill -0 "$lock_pid" 2>/dev/null
+            sleep 0.1
+          done
+          grep -q '^LOCK_READY$' "$lock_log"
+
+          set +e
+          printf '\n\n' |
+            script -qefc \
+              'pnpm openclaw models auth login --provider synthetic --method api-key --profile-id synthetic:new' \
+              "$RUNNER_TEMP/login-contended.raw" \
+              >"$RUNNER_TEMP/login-contended.console.raw" 2>&1
+          contended_status=${PIPESTATUS[1]}
+          set -e
+
+          cleanup_lock
+          trap - EXIT
+
+          node --input-type=module - <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+
+          const input = readFileSync(process.env.RUNNER_TEMP + "/login-contended.raw", "utf8");
+          const cleaned = input
+            .replaceAll(process.env.SYNTHETIC_API_KEY, "[redacted synthetic proof input]")
+            .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/gu, "")
+            .replace(/\u001b\[[0-?]*[ -\/]*[@-~]/gu, "")
+            .replaceAll("\r", "");
+          writeFileSync(process.env.RUNNER_TEMP + "/pr135443-proof/contended-login.txt", cleaned);
+          NODE
+
+          test "$contended_status" -ne 0
+          rg -F \
+            'The auth profile was saved, but its order could not be updated because the auth store is busy. Wait a moment, then retry the login.' \
+            "$proof_dir/contended-login.txt"
+          if rg -F 'Auth profile: synthetic:new' "$proof_dir/contended-login.txt"; then
+            echo "contended login emitted a false success line" >&2
+            exit 1
+          fi
+
+          pnpm openclaw models auth list --provider synthetic --json \
+            >"$proof_dir/profiles-after-contention.json"
+          pnpm openclaw models auth order get --provider synthetic --json \
+            >"$proof_dir/order-after-contention.json"
+          node --input-type=module - <<'NODE'
+          import { readFileSync } from "node:fs";
+
+          const root = process.env.RUNNER_TEMP + "/pr135443-proof/";
+          const profiles = JSON.parse(readFileSync(root + "profiles-after-contention.json", "utf8"));
+          const ids = profiles.profiles.map((profile) => profile.id).sort();
+          if (JSON.stringify(ids) !== JSON.stringify(["synthetic:new", "synthetic:old"])) {
+            throw new Error(`unexpected profiles after contention: ${JSON.stringify(ids)}`);
+          }
+          const order = JSON.parse(readFileSync(root + "order-after-contention.json", "utf8"));
+          if (JSON.stringify(order.order) !== JSON.stringify(["synthetic:old"])) {
+            throw new Error(`contention changed order: ${JSON.stringify(order.order)}`);
+          }
+          NODE
+
+          printf '\n\n' |
+            script -qefc \
+              'pnpm openclaw models auth login --provider synthetic --method api-key --profile-id synthetic:new' \
+              "$RUNNER_TEMP/login-retry.raw" \
+              >"$RUNNER_TEMP/login-retry.console.raw" 2>&1
+          node --input-type=module - <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+
+          const input = readFileSync(process.env.RUNNER_TEMP + "/login-retry.raw", "utf8");
+          const cleaned = input
+            .replaceAll(process.env.SYNTHETIC_API_KEY, "[redacted synthetic proof input]")
+            .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/gu, "")
+            .replace(/\u001b\[[0-?]*[ -\/]*[@-~]/gu, "")
+            .replaceAll("\r", "");
+          writeFileSync(process.env.RUNNER_TEMP + "/pr135443-proof/retry-login.txt", cleaned);
+          NODE
+
+          rg -F 'Auth profile: synthetic:new (synthetic/api_key)' "$proof_dir/retry-login.txt"
+          pnpm openclaw models auth order get --provider synthetic --json \
+            >"$proof_dir/order-after-retry.json"
+          node --input-type=module - <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+
+          const root = process.env.RUNNER_TEMP + "/pr135443-proof/";
+          const order = JSON.parse(readFileSync(root + "order-after-retry.json", "utf8"));
+          if (JSON.stringify(order.order) !== JSON.stringify(["synthetic:new", "synthetic:old"])) {
+            throw new Error(`retry did not promote profile: ${JSON.stringify(order.order)}`);
+          }
+          const summary = {
+            schemaVersion: 1,
+            targetSha: process.env.EXPECTED_SHA,
+            provider: "synthetic",
+            credentialInput: "synthetic and redacted",
+            contention: {
+              loginExit: "nonzero",
+              credentialSaved: true,
+              staleOrderPreserved: true,
+              falseSuccessOutput: false,
+              actionableRetryGuidance: true,
+            },
+            retry: {
+              loginExit: "zero",
+              newProfilePromoted: true,
+            },
+          };
+          writeFileSync(root + "summary.json", JSON.stringify(summary, null, 2) + "\n");
+          NODE
+
+          if rg -F "$SYNTHETIC_API_KEY" "$proof_dir"; then
+            echo "synthetic proof input leaked into proof artifacts" >&2
+            exit 1
+          fi
+
+      - name: Upload sanitized proof
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr135443-auth-order-real-behavior-${{ inputs.expected_sha }}
+          if-no-files-found: error
+          path: ${{ runner.temp }}/pr135443-proof
+          retention-days: 14
