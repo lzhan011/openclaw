@@ -170,10 +170,10 @@ jobs:
           NODE
 
           test "$contended_status" -eq 42
-          rg -F \
+          grep -F \
             'The auth profile was saved, but its order could not be updated because the auth store is busy. Wait a moment, then retry the login.' \
             "$proof_dir/contended-login.txt"
-          if rg -F 'Auth profile: synthetic:new' "$proof_dir/contended-login.txt"; then
+          if grep -F 'Auth profile: synthetic:new' "$proof_dir/contended-login.txt"; then
             echo "contended login emitted a false success line" >&2
             exit 1
           fi
@@ -215,7 +215,7 @@ jobs:
           writeFileSync(process.env.RUNNER_TEMP + "/pr135443-proof/retry-login.txt", cleaned);
           NODE
 
-          rg -F 'Auth profile: synthetic:new (synthetic/api_key)' "$proof_dir/retry-login.txt"
+          grep -F 'Auth profile: synthetic:new (synthetic/api_key)' "$proof_dir/retry-login.txt"
           pnpm openclaw models auth order get --provider synthetic --json \
             >"$proof_dir/order-after-retry.json"
           node --input-type=module - <<'NODE'
@@ -246,7 +246,7 @@ jobs:
           writeFileSync(root + "summary.json", JSON.stringify(summary, null, 2) + "\n");
           NODE
 
-          if rg -F "$SYNTHETIC_API_KEY" "$proof_dir"; then
+          if grep -R -F "$SYNTHETIC_API_KEY" "$proof_dir"; then
             echo "synthetic proof input leaked into proof artifacts" >&2
             exit 1
           fi
