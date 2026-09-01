@@ -184,7 +184,7 @@ jobs:
             "$EXPECTED_PR_HEAD" "$acknowledged" "$after_rows" "$after_genuine" "$after_forged" "$oldest_peer" "$newest_peer"
 
       - name: Upload redacted verdict
-        uses: actions/upload-artifact@043fb46d2fc27bad2f984749c76e56b553be8cb1 # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: pr134740-real-gateway-proof
           path: proof-output/runtime-verdict.json
