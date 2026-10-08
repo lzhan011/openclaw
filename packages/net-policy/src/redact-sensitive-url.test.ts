@@ -35,6 +35,14 @@ describe("redactSensitiveUrl", () => {
     );
   });
 
+  it("keeps redacting scoped token params whose hex suffix mixes digits and uppercase", () => {
+    expect(
+      redactSensitiveUrl(
+        "https://example.com/?token_0123456789ABCDEF=synthetic-secret&mms_token_ABCDEF0123456789=b&page=2",
+      ),
+    ).toBe("https://example.com/?token_0123456789ABCDEF=***&mms_token_ABCDEF0123456789=***&page=2");
+  });
+
   it("redacts encoded and invisible-spliced sensitive query param names", () => {
     expect(
       redactSensitiveUrl("https://example.com/mcp?client%5Fse%E2%80%8Bcret=secret&safe=value"),
